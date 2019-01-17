@@ -8,9 +8,13 @@ import Control.Concurrent.Chan
 import Control.Exception
 import Control.Monad
 
+import Control.Concurrent.STM
 import GHC.IO.Handle
-import System.IO
 import Network.Socket
+import System.IO
+
+import qualified Data.Map as M
+import qualified Control.Monad.HT as HT
 
 data Message = Message 
     { content :: String
@@ -18,6 +22,23 @@ data Message = Message
     } deriving (Show)
 
 type Channel = Chan Message
+
+data Room = Room
+    { users :: [String]
+    , roomName :: String 
+    , channel :: Channel
+    }
+type Rooms = M.Map String Room
+
+data Command = 
+    SwitchRoom String |
+    Quit |
+    ChangeUserName String
+
+data User = User
+    { userName :: String
+    , userHandle :: Handle
+    }
 
 addrInfo :: IO AddrInfo
 addrInfo = fmap head $ getAddrInfo (Just hints) Nothing (Just "3000")
@@ -39,52 +60,124 @@ createSocket addr = do
     listen sock 10 -- 10 users
     pure sock
 
-runLoop :: Channel -> Socket -> IO ()
-runLoop chan sock = forever $ do
+enterRoom :: TVar Rooms -> String -> String -> IO Room
+enterRoom rooms room user = do
+    chan <- newChan
+    (r@(Room _ name c), new) <- atomically (getRoom chan)
+
+    -- Empty the chan, because every socket will duplicate it and nobody will read from it
+    when new $ void . forkIO . forever $ do
+        (Message msg msgAuthor) <- readChan c
+        putStrLn $ "from '" ++ msgAuthor ++ "' in '" ++ name ++ "': " ++ msg 
+
+    pure r
+
+    where
+        getRoom :: Channel -> STM (Room, Bool)
+        getRoom chan = do
+            rms <- readTVar rooms :: STM Rooms
+            let r@((Room us name c), _) = getLastRoom rms room chan
+    
+            let newRoom = Room (user : us) name c
+            let newRooms = M.insert room newRoom rms
+    
+            writeTVar rooms newRooms
+            pure r
+    
+            where 
+                getLastRoom :: Rooms -> String -> Channel -> (Room, Bool)
+                getLastRoom rooms room chan = case M.lookup room rooms of
+                    Nothing -> (Room [] room chan, True)
+                    (Just r) -> (r, False) 
+
+runLoop :: TVar Rooms -> Socket -> IO ()
+runLoop rooms sock = forever $ do
     (conn, addr) <- accept sock -- accept the next connection
     putStrLn $ "Connection from " ++ (show addr)
-    copiedChan <- dupChan chan
-    forkFinally (runClient copiedChan conn) (\_ -> close conn)
+    forkFinally (runClient rooms conn) (\_ -> close conn)
 
-runClient :: Channel -> Socket -> IO ()
-runClient chan sock = do
+isValidUserName :: String -> Bool
+isValidUserName name = name /= "Server" 
+
+parseCommand :: String -> Maybe Command
+parseCommand str = parse $ words str
+    where
+        parse :: [String] -> Maybe Command
+        parse ["quit"] = Just Quit
+        parse ["move", room] = Just $ SwitchRoom room
+        parse ["name", name] | isValidUserName name = Just $ ChangeUserName name
+        parse _ = Nothing
+
+putClientInRoom :: TVar Rooms -> User -> String -> IO ()
+putClientInRoom rooms (User user hdl) = changeRoom
+        where 
+            changeRoom :: String -> IO ()
+            changeRoom room = do
+                (Room users _ chan) <- enterRoom rooms room user
+                hPutStrLn hdl $ "You entered room " ++ room
+                let onlineMsg = user ++ " entered the room " ++ room
+                putStrLn onlineMsg
+                writeChan chan $ Message onlineMsg "Server"
+            
+                copiedChan <- dupChan chan
+                th <- forkIO $ receiver user copiedChan hdl
+                eitherAction <- try $ sender user room chan hdl :: IO (Either SomeException (IO ()))
+            
+                let offlineMsg = user ++ " exit the room " ++ room
+                putStrLn offlineMsg
+                writeChan chan $ Message offlineMsg "Server"
+                killThread th
+                case eitherAction of 
+                    Left _ -> pure ()
+                    Right a -> a
+            
+            -- Will transmit any message in the chan to the user
+            receiver :: String -> Channel -> Handle -> IO ()
+            receiver author chan hdl = forever $ do
+                (Message msg msgAuthor) <- readChan chan
+                when (msgAuthor /= author) $ hPutStrLn hdl $ "[" ++ msgAuthor ++ "] " ++  msg
+    
+            -- Will transmit any message from the user to the chan
+            sender :: String -> String -> Channel -> Handle -> IO (IO ())
+            sender author room chan hdl = loop 
+                where 
+                    loop = do
+                        msg <- hGetLine hdl
+                        if (not . null) msg && head msg == '/'
+                            then do
+                                let com = parseCommand $ tail msg
+                                case com of
+                                    Nothing -> do
+                                        hPutStrLn hdl "[Server] Unknown command"
+                                        putStrLn $ "[Server] " ++ author ++ " entered unknown command: " ++ (tail msg)
+                                        loop
+
+                                    (Just Quit) -> do
+                                        putStrLn $ "[Server] " ++ author ++ " is leaving"
+                                        pure $ pure ()
+
+                                    (Just (SwitchRoom nextRoom)) -> do
+                                        putStrLn $ "[Server] " ++ author ++ " switch room " ++ room ++ "=>" ++ nextRoom
+                                        pure $ changeRoom nextRoom 
+
+                                    (Just (ChangeUserName newUser)) -> do
+                                        putStrLn $ "[Server] User change his name " ++ author ++ "=>" ++ newUser
+                                        pure $ putClientInRoom rooms (User newUser hdl) room
+                            else do
+                                writeChan chan $ Message msg author
+                                loop
+            
+runClient :: TVar Rooms -> Socket -> IO ()
+runClient rooms sock = do
     hdl <- socketToHandle sock ReadWriteMode
     hSetBuffering hdl NoBuffering
 
-    hPutStrLn hdl "What's your name ?"
-    author <- fmap init $ hGetLine hdl
+    name <- HT.until isValidUserName $ do
+        hPutStrLn hdl "What's your name ?"
+        fmap init $ hGetLine hdl
 
-    let authorOnlineMsg = author ++ " is online"
-    putStrLn authorOnlineMsg
-    writeChan chan $ Message authorOnlineMsg "Server"
-
-    copiedChan <- dupChan chan
-    th <- forkIO $ receiver author copiedChan hdl
-    try $ sender author chan hdl :: IO (Either SomeException ())
-
-    let authorOfflineMsg = author ++ " is offline"
-    putStrLn authorOnlineMsg
-    writeChan chan $ Message authorOfflineMsg "Server"
-    end hdl th
-
-    where
-        -- Will transmit any message in the chan to the user
-        receiver :: String -> Channel -> Handle -> IO ()
-        receiver author chan hdl = forever $ do
-            (Message msg msgAuthor) <- readChan chan
-            when (msgAuthor /= author) $ hPutStrLn hdl $ "[" ++ msgAuthor ++ "] " ++  msg
-
-        -- Will transmit any message from the user to the chan
-        sender :: String -> Channel -> Handle -> IO ()
-        sender author chan hdl = forever $ do
-            msg <- hGetLine hdl
-            writeChan chan $ Message msg author
-
-        -- Close eveything
-        end :: Handle -> ThreadId -> IO ()
-        end hdl th = do
-            killThread th
-            hClose hdl
+    putClientInRoom rooms (User name hdl) "waiting_room"
+    hClose hdl
 
 runServer :: IO ()
 runServer = withSocketsDo $ do
@@ -93,11 +186,8 @@ runServer = withSocketsDo $ do
 
     let sock = createSocket addr
 
-    -- create the common Chan
-    chan <- newChan
-
-    -- Empty the chan, because every socket will duplicate it and nobody will read from it
-    forkIO . forever . void $ readChan chan
+    -- Room List
+    rooms <- atomically $ newTVar M.empty
 
     -- create the socket, loop, then close it
-    bracket sock close $ runLoop chan
+    bracket sock close $ runLoop rooms
