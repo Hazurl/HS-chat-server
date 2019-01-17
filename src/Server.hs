@@ -15,6 +15,7 @@ import System.IO
 
 import qualified Data.Map as M
 import qualified Control.Monad.HT as HT
+import Data.List
 
 data Message = Message 
     { content :: String
@@ -24,7 +25,7 @@ data Message = Message
 type Channel = Chan Message
 
 data Room = Room
-    { users :: [String]
+    { roomUsers :: [String]
     , roomName :: String 
     , channel :: Channel
     }
@@ -33,7 +34,8 @@ type Rooms = M.Map String Room
 data Command = 
     SwitchRoom String |
     Quit |
-    ChangeUserName String
+    ChangeUserName String |
+    UserList
 
 data User = User
     { userName :: String
@@ -90,6 +92,17 @@ enterRoom rooms room user = do
                     Nothing -> (Room [] room chan, True)
                     (Just r) -> (r, False) 
 
+leaveRoom :: TVar Rooms -> String -> String -> IO ()
+leaveRoom rooms room user = atomically $ do
+    rms <- readTVar rooms :: STM Rooms
+    let newRooms = M.update (removeUser user) room rms
+    writeTVar rooms newRooms
+    pure ()
+
+    where
+        removeUser :: String -> Room -> Maybe Room
+        removeUser user (Room users name chan) = let nextUserList = filter (/= user) users in if null nextUserList then Nothing else Just $ Room nextUserList name chan
+
 runLoop :: TVar Rooms -> Socket -> IO ()
 runLoop rooms sock = forever $ do
     (conn, addr) <- accept sock -- accept the next connection
@@ -104,6 +117,7 @@ parseCommand str = parse $ words str
     where
         parse :: [String] -> Maybe Command
         parse ["quit"] = Just Quit
+        parse ["users"] = Just UserList
         parse ["move", room] = Just $ SwitchRoom room
         parse ["name", name] | isValidUserName name = Just $ ChangeUserName name
         parse _ = Nothing
@@ -123,6 +137,7 @@ putClientInRoom rooms (User user hdl) = changeRoom
                 th <- forkIO $ receiver user copiedChan hdl
                 eitherAction <- try $ sender user room chan hdl :: IO (Either SomeException (IO ()))
             
+                leaveRoom rooms room user
                 let offlineMsg = user ++ " exit the room " ++ room
                 putStrLn offlineMsg
                 writeChan chan $ Message offlineMsg "Server"
@@ -152,17 +167,24 @@ putClientInRoom rooms (User user hdl) = changeRoom
                                         putStrLn $ "[Server] " ++ author ++ " entered unknown command: " ++ (tail msg)
                                         loop
 
-                                    (Just Quit) -> do
+                                    Just Quit -> do
                                         putStrLn $ "[Server] " ++ author ++ " is leaving"
                                         pure $ pure ()
 
-                                    (Just (SwitchRoom nextRoom)) -> do
+                                    Just (SwitchRoom nextRoom) -> do
                                         putStrLn $ "[Server] " ++ author ++ " switch room " ++ room ++ "=>" ++ nextRoom
                                         pure $ changeRoom nextRoom 
 
-                                    (Just (ChangeUserName newUser)) -> do
+                                    Just (ChangeUserName newUser) -> do
                                         putStrLn $ "[Server] User change his name " ++ author ++ "=>" ++ newUser
                                         pure $ putClientInRoom rooms (User newUser hdl) room
+
+                                    Just UserList -> do
+                                        rs <- atomically $ readTVar rooms
+                                        let users = roomUsers $ (M.!) rs room -- The room must exist as the user is in it
+                                        hPutStrLn hdl $ "Users: " ++ (concat $ intersperse ", " users)
+                                        putStrLn $ "[Server] " ++ author ++ " asks for the users in the room"
+                                        loop
                             else do
                                 writeChan chan $ Message msg author
                                 loop
